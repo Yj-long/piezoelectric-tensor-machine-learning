@@ -1,1 +1,1 @@
-Accurate piezoelectric tensor predication with equivariant attention graph neural network
+Accurate piezoelectric tensor predication with equivariant attention graph neural network,we will introduce SO(2) tensor product operations to replace the current SO(3) tensor product operations, in order to accelerate model performance and enhance its expressive power. The complete code and pretrained models will be provided later.
