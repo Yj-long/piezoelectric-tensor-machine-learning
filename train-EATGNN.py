@@ -54,12 +54,31 @@ device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # pandarallel.initialize(progress_bar=True, verbose=True)
 # torch.autograd.set_detect_anomaly(True)
 
-n=-1
+SEED = 42
+DATA_PATH = "4201350.json"
+TARGET_KEY = "total"
+SAVE_DIR = "checkpoints_eatgnn"
+BEST_MODEL_PATH = os.path.join(SAVE_DIR, "best_model.pt")
+LAST_MODEL_PATH = os.path.join(SAVE_DIR, "last_model.pt")
+LOG_CSV_PATH = os.path.join(SAVE_DIR, "training_log.csv")
+
+n=None
 batch_size =16
 epochs=30
 #define the multihead attention
 heads=2
 lmax=3
+
+
+def set_seed(seed: int = 42):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+set_seed(SEED)
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 
 class EquivariantLayerNormFast(torch.nn.Module):
@@ -469,7 +488,7 @@ def split(dataset,size):
 
 
 
-p=pd.read_json("4201350.json")
+p=pd.read_json(DATA_PATH)
 # p=pd.read_json("pie20627.json")
 struct=[AseAtomsAdaptor.get_atoms(Structure.from_dict(i)) for i in p['structure'][:n]]
 
@@ -491,7 +510,7 @@ dim=len(fea[0])
 # fea=torch.as_tensor(fea)
 
 # TR=Fromtensor('ijk=ikj')
-dummy_energies=[i for i in p['total'][:n]]
+dummy_energies=[i for i in p[TARGET_KEY][:n]]
 # print(dummy_energies)
 
 dataset=[]
@@ -513,15 +532,18 @@ def datatransform(crystal,property):
 
     edge_src, edge_dst, edge_shift = ase.neighborlist.neighbor_list("ijS", a=crystal, cutoff=r_cut,
                                                                     self_interaction=False)
+    target_tensor = torch.as_tensor(property, dtype=default_dtype)
+    if target_tensor.ndim == 0:
+        target_tensor = target_tensor.unsqueeze(0)
+    target_tensor = target_tensor.unsqueeze(0).float()
+
     data = torch_geometric.data.Data(
-        pos=torch.as_tensor(crystal.get_positions()).to(device).float(),
-        lattice=(torch.as_tensor(crystal.cell.array).unsqueeze(0)).to(device).float(),  # We add a dimension for batching
-        x=torch.as_tensor([fea[atomic_numbers[atom] - 1] for atom in crystal.symbols]).to(device).float(),
-
-        edge_index=torch.stack([torch.LongTensor(edge_src), torch.LongTensor(edge_dst)], dim=0).to(device),
-        edge_shift=torch.as_tensor(edge_shift, dtype=default_dtype).to(device).float(),
-        energy=torch.unsqueeze(torch.as_tensor(property).to(device), 0).float(),
-
+        pos=torch.as_tensor(crystal.get_positions(), dtype=default_dtype).float(),
+        lattice=torch.as_tensor(crystal.cell.array, dtype=default_dtype).unsqueeze(0).float(),  # We add a dimension for batching
+        x=torch.as_tensor([fea[atomic_numbers[atom] - 1] for atom in crystal.symbols], dtype=default_dtype).float(),
+        edge_index=torch.stack([torch.LongTensor(edge_src), torch.LongTensor(edge_dst)], dim=0),
+        edge_shift=torch.as_tensor(edge_shift, dtype=default_dtype).float(),
+        energy=target_tensor,
     )
     return data
 
@@ -823,7 +845,7 @@ class Network(torch.nn.Module):
         if 'batch' in data:
             batch = data['batch']
         else:
-            batch = data['pos'].new_zeros(data['pos'].shape[0], dtype=torch.float)
+            batch = data['pos'].new_zeros(data['pos'].shape[0], dtype=torch.long)
 
         edge_src = data['edge_index'][0]  # Edge source
         edge_dst = data['edge_index'][1]  # Edge destination
@@ -902,44 +924,170 @@ scaler=GradScaler()
 scheduler = torch.optim.lr_scheduler.ExponentialLR(optim,gamma=0.99)
 
 
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def evaluate_tensor_metrics(pred, target):
+    diff = pred - target
+    mae = diff.abs().mean().item()
+    rmse = torch.sqrt((diff ** 2).mean()).item()
+    max_abs = diff.abs().max().item()
+    return mae, rmse, max_abs
+
+
+def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, metrics, config):
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "metrics": metrics,
+        "config": config,
+    }, path)
+
+
+config = {
+    "data_path": DATA_PATH,
+    "target_key": TARGET_KEY,
+    "formula": "ijk=ikj",
+    "batch_size": batch_size,
+    "epochs": epochs,
+    "lr": 0.005,
+    "max_radius": max_radius,
+    "radial_cutoff": radial_cutoff,
+    "heads": heads,
+    "lmax": lmax,
+    "seed": SEED,
+}
+
+sample_target_shape = tuple(train_dataloader.dataset[0].energy.shape)
+print(f"Device: {device}")
+print(f"Train samples: {len(train_dataloader.dataset)} | Valid samples: {len(valid_dataloader.dataset)}")
+print(f"Tensor label shape per sample: {sample_target_shape}")
+print(f"Trainable parameters: {count_parameters(net):,}")
+print(f"Best checkpoint will be saved to: {BEST_MODEL_PATH}")
+
+best_valid_loss = float("inf")
+history = []
+
 for epoch in range(epochs):
-    trainloss = 0.0
-    validloss = 0.0
-    score = 0.0
+    train_loss_sum = 0.0
+    train_mae_sum = 0.0
+    train_rmse_sum = 0.0
+
+    valid_loss_sum = 0.0
+    valid_mae_sum = 0.0
+    valid_rmse_sum = 0.0
+    valid_max_abs_sum = 0.0
+
     net.train()
-    # optim.zero_grad()
-    for batch in tqdm(train_dataloader):
+    train_bar = tqdm(train_dataloader, desc=f"Epoch {epoch + 1}/{epochs} [train]")
+    for batch in train_bar:
+        batch = batch.to(device)
         optim.zero_grad()
+
         with autocast():
             output = net(batch)
-            # print(num,output)
             l = loss(output, batch.energy)
-            trainloss+=l.item()
-        # print(l)
+
         if torch.isnan(output).any():
             print('output is nan')
+
         if torch.isnan(l):
             print("NaN detected in loss before backward")
-            # print(output)
-        else:
-            scaler.scale(l).backward()
-            # if any(torch.isnan(param.grad).any() for param in net.parameters()):
-            #     print("NaN detected in gradients")
-            scaler.unscale_(optim)
-            clip_grad_norm_(net.parameters(), max_norm=1.0)
+            continue
 
-            scaler.step(optim)
-            scaler.update()
-                # optim.zero_grad()
+        scaler.scale(l).backward()
+        scaler.unscale_(optim)
+        grad_norm = clip_grad_norm_(net.parameters(), max_norm=1.0)
+        scaler.step(optim)
+        scaler.update()
+
+        batch_mae, batch_rmse, _ = evaluate_tensor_metrics(output.detach(), batch.energy.detach())
+        train_loss_sum += l.item()
+        train_mae_sum += batch_mae
+        train_rmse_sum += batch_rmse
+        train_bar.set_postfix(loss=f"{l.item():.4e}", mae=f"{batch_mae:.4e}", grad=f"{float(grad_norm):.3f}")
+
     scheduler.step()
-    net.eval()
-    with torch.no_grad():
-        for batch in tqdm(valid_dataloader):
-            with autocast():
-                output=net(batch)
-                l=loss(output,batch.energy).item()
-            validloss+=l
-            score+=torch.mean(torch.abs((output-batch.energy))).item()
 
-    print("epoch{} train_loss={},valid_loss={}".format(epoch, trainloss/len(train_dataloader), validloss/len(valid_dataloader)))
-    print("MAE={}".format(score/len(valid_dataloader)))
+    train_loss = train_loss_sum / max(len(train_dataloader), 1)
+    train_mae = train_mae_sum / max(len(train_dataloader), 1)
+    train_rmse = train_rmse_sum / max(len(train_dataloader), 1)
+
+    net.eval()
+    valid_bar = tqdm(valid_dataloader, desc=f"Epoch {epoch + 1}/{epochs} [valid]")
+    with torch.no_grad():
+        for batch in valid_bar:
+            batch = batch.to(device)
+            with autocast():
+                output = net(batch)
+                l = loss(output, batch.energy)
+
+            batch_mae, batch_rmse, batch_max_abs = evaluate_tensor_metrics(output, batch.energy)
+            valid_loss_sum += l.item()
+            valid_mae_sum += batch_mae
+            valid_rmse_sum += batch_rmse
+            valid_max_abs_sum += batch_max_abs
+            valid_bar.set_postfix(loss=f"{l.item():.4e}", mae=f"{batch_mae:.4e}")
+
+    valid_loss = valid_loss_sum / max(len(valid_dataloader), 1)
+    valid_mae = valid_mae_sum / max(len(valid_dataloader), 1)
+    valid_rmse = valid_rmse_sum / max(len(valid_dataloader), 1)
+    valid_max_abs = valid_max_abs_sum / max(len(valid_dataloader), 1)
+    current_lr = scheduler.get_last_lr()[0]
+
+    epoch_metrics = {
+        "epoch": epoch + 1,
+        "lr": current_lr,
+        "train_loss": train_loss,
+        "train_mae": train_mae,
+        "train_rmse": train_rmse,
+        "valid_loss": valid_loss,
+        "valid_mae": valid_mae,
+        "valid_rmse": valid_rmse,
+        "valid_max_abs": valid_max_abs,
+    }
+    history.append(epoch_metrics)
+    pd.DataFrame(history).to_csv(LOG_CSV_PATH, index=False)
+
+    improved = valid_loss < best_valid_loss
+    if improved:
+        best_valid_loss = valid_loss
+        save_checkpoint(
+            BEST_MODEL_PATH,
+            epoch + 1,
+            net,
+            optim,
+            scheduler,
+            scaler,
+            epoch_metrics,
+            config,
+        )
+
+    save_checkpoint(
+        LAST_MODEL_PATH,
+        epoch + 1,
+        net,
+        optim,
+        scheduler,
+        scaler,
+        epoch_metrics,
+        config,
+    )
+
+    print(
+        f"[Epoch {epoch + 1:03d}/{epochs:03d}] "
+        f"lr={current_lr:.3e} | "
+        f"train_loss={train_loss:.6e} | train_mae={train_mae:.6e} | train_rmse={train_rmse:.6e} | "
+        f"valid_loss={valid_loss:.6e} | valid_mae={valid_mae:.6e} | valid_rmse={valid_rmse:.6e} | valid_max_abs={valid_max_abs:.6e}"
+    )
+    if improved:
+        print(f"  -> best model updated: {BEST_MODEL_PATH}")
+
+print(f"Training finished. Best valid_loss = {best_valid_loss:.6e}")
+print(f"Best checkpoint: {BEST_MODEL_PATH}")
+print(f"Last checkpoint: {LAST_MODEL_PATH}")
+print(f"Training log CSV: {LOG_CSV_PATH}")
