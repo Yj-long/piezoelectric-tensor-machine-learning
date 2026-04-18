@@ -9,6 +9,7 @@ from pymatgen.core import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
 import os
+import json
 import pandas as pd
 
 from jarvis.core import specie
@@ -55,7 +56,7 @@ device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 # torch.autograd.set_detect_anomaly(True)
 
 SEED = 42
-DATA_PATH = "4201350.json"
+DATA_PATH = r"E:\EATGNN\dataset.json"
 TARGET_KEY = "total"
 SAVE_DIR = "checkpoints_eatgnn"
 BEST_MODEL_PATH = os.path.join(SAVE_DIR, "best_model.pt")
@@ -64,8 +65,13 @@ LOG_CSV_PATH = os.path.join(SAVE_DIR, "training_log.csv")
 
 n=None
 batch_size =16
-epochs=30
-#define the multihead attention
+epochs=300
+train_ratio=0.8
+valid_ratio=0.1
+test_ratio=0.1
+# define the multihead attention
+# NOTE: with current irreps choices some intermediate irreps can have multiplicity=1,
+# so default to single-head to keep all layers valid.
 heads=2
 lmax=3
 
@@ -478,9 +484,22 @@ class Compose(torch.nn.Module):
         return self.second(x)
 
 
-def split(dataset,size):
-    train_data, test_data = train_test_split(dataset, test_size=size, random_state=42,shuffle=True)
-    return train_data, test_data
+def split(dataset, train_ratio=0.8, valid_ratio=0.1, test_ratio=0.1, seed=42):
+    total = train_ratio + valid_ratio + test_ratio
+    if not math.isclose(total, 1.0, rel_tol=1e-6, abs_tol=1e-6):
+        raise ValueError(f"train/valid/test ratios must sum to 1.0, got {total}")
+
+    train_data, holdout_data = train_test_split(
+        dataset, test_size=(1.0 - train_ratio), random_state=seed, shuffle=True
+    )
+    if len(holdout_data) == 0:
+        return train_data, [], []
+
+    test_share_in_holdout = test_ratio / (valid_ratio + test_ratio)
+    valid_data, test_data = train_test_split(
+        holdout_data, test_size=test_share_in_holdout, random_state=seed, shuffle=True
+    )
+    return train_data, valid_data, test_data
 
 
 
@@ -532,10 +551,27 @@ def datatransform(crystal,property):
 
     edge_src, edge_dst, edge_shift = ase.neighborlist.neighbor_list("ijS", a=crystal, cutoff=r_cut,
                                                                     self_interaction=False)
-    target_tensor = torch.as_tensor(property, dtype=default_dtype)
-    if target_tensor.ndim == 0:
+    target_tensor = torch.as_tensor(property, dtype=default_dtype).float()
+    if target_tensor.ndim == 1 and target_tensor.numel() == 3:
+        # Diagonal-only labels: [xx, yy, zz]
+        target_tensor = torch.diag(target_tensor)
+        target_mask = torch.eye(3, dtype=default_dtype)
+    elif target_tensor.ndim == 2 and target_tensor.shape == (3, 3):
+        # Full 3x3 labels: NaN entries are treated as missing labels
+        target_mask = torch.isfinite(target_tensor).to(default_dtype)
+        target_tensor = torch.nan_to_num(target_tensor, nan=0.0)
+    elif target_tensor.ndim == 0:
         target_tensor = target_tensor.unsqueeze(0)
-    target_tensor = target_tensor.unsqueeze(0).float()
+        target_mask = torch.ones_like(target_tensor)
+    else:
+        raise ValueError(
+            f"Unsupported target shape {tuple(target_tensor.shape)}. "
+            "Expected [3] (diagonal-only) or [3, 3] (full tensor)."
+        )
+
+    # Keep graph-level labels as [1, ...] so PyG DataLoader batches them as [B, ...]
+    target_tensor = target_tensor.unsqueeze(0)
+    target_mask = target_mask.unsqueeze(0)
 
     data = torch_geometric.data.Data(
         pos=torch.as_tensor(crystal.get_positions(), dtype=default_dtype).float(),
@@ -544,6 +580,7 @@ def datatransform(crystal,property):
         edge_index=torch.stack([torch.LongTensor(edge_src), torch.LongTensor(edge_dst)], dim=0),
         edge_shift=torch.as_tensor(edge_shift, dtype=default_dtype).float(),
         energy=target_tensor,
+        energy_mask=target_mask,
     )
     return data
 
@@ -555,12 +592,19 @@ for crystal, energy in zip(struct, dummy_energies):
 # print(dataset)
 
 # dataset=shuffle(dataset)
-traindataset,validdataset=split(dataset,0.1)
+traindataset,validdataset,testdataset = split(
+    dataset,
+    train_ratio=train_ratio,
+    valid_ratio=valid_ratio,
+    test_ratio=test_ratio,
+    seed=SEED,
+)
 
 train_dataloader = DataLoader(traindataset, batch_size=batch_size)
 valid_dataloader = DataLoader(validdataset,batch_size=batch_size)
+test_dataloader = DataLoader(testdataset,batch_size=batch_size)
 
-del dataset,traindataset,validdataset
+del dataset,traindataset,validdataset,testdataset
 
 
 
@@ -573,7 +617,19 @@ from torch_scatter import scatter
 def multiheadsplit(x):
     ll=[]
     for mul,ir in x:
-        ll.append((int(mul//int(heads)),ir))
+        if mul % int(heads) != 0:
+            raise ValueError(
+                f"Irrep multiplicity {mul} for {ir} is not divisible by heads={heads}. "
+                "Please set heads accordingly or increase multiplicities in irreps."
+            )
+        per_head = int(mul // int(heads))
+        if per_head > 0:
+            ll.append((per_head, ir))
+    if len(ll) == 0:
+        raise ValueError(
+            f"multiheadsplit produced empty irreps for heads={heads}. "
+            "Set heads=1 or use larger multiplicities in irreps."
+        )
     return o3.Irreps(ll)
 
 
@@ -907,8 +963,8 @@ net = Network(
     # irreps_key="32x0e+32x0o+16x1e+16x1o+8x2e+8x2o+4x3e+4x3o+2x4e+2x4o",
     irreps_query="32x0e+32x0o+16x1e+16x1o+8x2e+8x2o+4x3e+4x3o+2x4e+2x4o",
     irreps_key="32x0e+32x0o+16x1e+16x1o+8x2e+8x2o+4x3e+4x3o+2x4e+2x4o",
-    irreps_out="8x1o+4x2o+2x3o",
-    formula="ijk=ikj",
+    irreps_out="2x0e+2x1o+2x2e",
+    formula="ij",
     max_radius=max_radius, # Cutoff radius for convolution
     num_nodes=num_nodes,
     pool_nodes=True,  # We pool nodes to predict properties.
@@ -918,8 +974,6 @@ net=net.to(device)
 
 from torch.nn.utils import clip_grad_norm_
 optim=torch.optim.AdamW(net.parameters(),lr=0.005)
-loss=torch.nn.MSELoss()
-loss=loss.to(device)
 scaler=GradScaler()
 scheduler = torch.optim.lr_scheduler.ExponentialLR(optim,gamma=0.99)
 
@@ -930,6 +984,137 @@ def count_parameters(model):
 
 def evaluate_tensor_metrics(pred, target):
     diff = pred - target
+    mae = diff.abs().mean().item()
+    rmse = torch.sqrt((diff ** 2).mean()).item()
+    max_abs = diff.abs().max().item()
+    return mae, rmse, max_abs
+
+
+def tensor_to_scalar_q_components(tensor_3x3: torch.Tensor):
+    """Decompose a (possibly batched) 3x3 tensor into scalar s and five q components."""
+    sym = 0.5 * (tensor_3x3 + tensor_3x3.transpose(-1, -2))
+    xx, yy, zz = sym[..., 0, 0], sym[..., 1, 1], sym[..., 2, 2]
+    xy, yz, xz = sym[..., 0, 1], sym[..., 1, 2], sym[..., 0, 2]
+
+    s = (xx + yy + zz) / 3.0
+    q1 = 0.5 * (xx - yy)
+    q2 = (2.0 * zz - xx - yy) / (2.0 * math.sqrt(3.0))
+    q3 = xy
+    q4 = yz
+    q5 = xz
+    q = torch.stack([q1, q2, q3, q4, q5], dim=-1)
+    return s, q
+
+
+def mask_to_component_mask(mask_3x3: torch.Tensor):
+    """Map element-wise 3x3 supervision mask to [s, q1..q5] supervision masks."""
+    valid = mask_3x3 > 0.5
+    m_xx, m_yy, m_zz = valid[..., 0, 0], valid[..., 1, 1], valid[..., 2, 2]
+    m_xy, m_yz, m_xz = valid[..., 0, 1], valid[..., 1, 2], valid[..., 0, 2]
+
+    # s, q1, q2 all depend on the three diagonal terms
+    m_diag = m_xx & m_yy & m_zz
+    m_s = m_diag
+    m_q = torch.stack([m_diag, m_diag, m_xy, m_yz, m_xz], dim=-1)
+    return m_s, m_q
+
+
+def weighted_masked_huber_loss(
+    pred,
+    target,
+    mask,
+    ws: float = 1.0,
+    wq = (1.0, 1.0, 1.0, 1.0, 1.0),
+    delta: float = 1.0,
+):
+    pred_s, pred_q = tensor_to_scalar_q_components(pred)
+    target_s, target_q = tensor_to_scalar_q_components(target)
+    m_s, m_q = mask_to_component_mask(mask)
+
+    total_loss = pred.sum() * 0.0
+    total_weight = 0.0
+
+    if m_s.any():
+        l_s = F.huber_loss(pred_s[m_s], target_s[m_s], reduction="mean", delta=delta)
+        total_loss = total_loss + ws * l_s
+        total_weight += ws
+
+    for k in range(5):
+        mk = m_q[..., k]
+        wk = float(wq[k])
+        if mk.any():
+            l_qk = F.huber_loss(pred_q[..., k][mk], target_q[..., k][mk], reduction="mean", delta=delta)
+            total_loss = total_loss + wk * l_qk
+            total_weight += wk
+
+    if total_weight == 0.0:
+        return total_loss
+    return total_loss / total_weight
+
+
+def estimate_loss_hparams_from_trainset(train_dataset):
+    """
+    Estimate loss_wq and huber_delta from supervised targets in the training set.
+    - loss_wq: inverse per-component scale (normalized to mean=1 on observed components)
+    - huber_delta: robust global scale estimated from supervised [s, q1..q5]
+    """
+    q_values = [[] for _ in range(5)]
+    sq_values = []
+
+    for sample in train_dataset:
+        target = sample.energy
+        mask = sample.energy_mask
+        if target.ndim == 2:
+            target = target.unsqueeze(0)
+            mask = mask.unsqueeze(0)
+
+        s, q = tensor_to_scalar_q_components(target)
+        m_s, m_q = mask_to_component_mask(mask)
+
+        if m_s.any():
+            s_vals = s[m_s].detach().cpu()
+            sq_values.append(s_vals)
+
+        for k in range(5):
+            mk = m_q[..., k]
+            if mk.any():
+                qk_vals = q[..., k][mk].detach().cpu()
+                q_values[k].append(qk_vals)
+                sq_values.append(qk_vals)
+
+    wq = torch.ones(5, dtype=torch.float32)
+    observed = []
+    for k in range(5):
+        if len(q_values[k]) == 0:
+            wq[k] = 0.0
+            continue
+        vals = torch.cat(q_values[k], dim=0).float()
+        scale = vals.std(unbiased=False).clamp_min(1e-6)
+        wq[k] = 1.0 / scale
+        observed.append(k)
+
+    if len(observed) > 0:
+        wq_mean = wq[observed].mean().clamp_min(1e-6)
+        wq[observed] = wq[observed] / wq_mean
+
+    if len(sq_values) == 0:
+        huber_delta = 1.0
+    else:
+        all_vals = torch.cat(sq_values, dim=0).float()
+        med = all_vals.median()
+        mad = (all_vals - med).abs().median().clamp_min(1e-6)
+        robust_sigma = 1.4826 * mad
+        huber_delta = float((1.345 * robust_sigma).item())
+        huber_delta = max(huber_delta, 1e-3)
+
+    return wq.tolist(), huber_delta
+
+
+def evaluate_masked_tensor_metrics(pred, target, mask):
+    valid = mask > 0.5
+    if not valid.any():
+        return 0.0, 0.0, 0.0
+    diff = pred[valid] - target[valid]
     mae = diff.abs().mean().item()
     rmse = torch.sqrt((diff ** 2).mean()).item()
     max_abs = diff.abs().max().item()
@@ -951,8 +1136,16 @@ def save_checkpoint(path, epoch, model, optimizer, scheduler, scaler, metrics, c
 config = {
     "data_path": DATA_PATH,
     "target_key": TARGET_KEY,
-    "formula": "ijk=ikj",
+    "formula": "ij",
+    "supervision": "masked_diagonal_supported",
+    "loss_type": "weighted_masked_huber_s_q",
+    "loss_ws": 1.0,
+    "loss_wq": None,
+    "huber_delta": None,
     "batch_size": batch_size,
+    "train_ratio": train_ratio,
+    "valid_ratio": valid_ratio,
+    "test_ratio": test_ratio,
     "epochs": epochs,
     "lr": 0.005,
     "max_radius": max_radius,
@@ -962,9 +1155,20 @@ config = {
     "seed": SEED,
 }
 
+estimated_wq, estimated_delta = estimate_loss_hparams_from_trainset(train_dataloader.dataset)
+config["loss_wq"] = estimated_wq
+config["huber_delta"] = estimated_delta
+
+print(f"Auto-estimated loss_wq: {config['loss_wq']}")
+print(f"Auto-estimated huber_delta: {config['huber_delta']:.6f}")
+
 sample_target_shape = tuple(train_dataloader.dataset[0].energy.shape)
 print(f"Device: {device}")
-print(f"Train samples: {len(train_dataloader.dataset)} | Valid samples: {len(valid_dataloader.dataset)}")
+print(
+    f"Train samples: {len(train_dataloader.dataset)} | "
+    f"Valid samples: {len(valid_dataloader.dataset)} | "
+    f"Test samples: {len(test_dataloader.dataset)}"
+)
 print(f"Tensor label shape per sample: {sample_target_shape}")
 print(f"Trainable parameters: {count_parameters(net):,}")
 print(f"Best checkpoint will be saved to: {BEST_MODEL_PATH}")
@@ -990,7 +1194,14 @@ for epoch in range(epochs):
 
         with autocast():
             output = net(batch)
-            l = loss(output, batch.energy)
+            l = weighted_masked_huber_loss(
+                output,
+                batch.energy,
+                batch.energy_mask,
+                ws=config["loss_ws"],
+                wq=config["loss_wq"],
+                delta=config["huber_delta"],
+            )
 
         if torch.isnan(output).any():
             print('output is nan')
@@ -1005,7 +1216,9 @@ for epoch in range(epochs):
         scaler.step(optim)
         scaler.update()
 
-        batch_mae, batch_rmse, _ = evaluate_tensor_metrics(output.detach(), batch.energy.detach())
+        batch_mae, batch_rmse, _ = evaluate_masked_tensor_metrics(
+            output.detach(), batch.energy.detach(), batch.energy_mask.detach()
+        )
         train_loss_sum += l.item()
         train_mae_sum += batch_mae
         train_rmse_sum += batch_rmse
@@ -1024,9 +1237,18 @@ for epoch in range(epochs):
             batch = batch.to(device)
             with autocast():
                 output = net(batch)
-                l = loss(output, batch.energy)
+                l = weighted_masked_huber_loss(
+                    output,
+                    batch.energy,
+                    batch.energy_mask,
+                    ws=config["loss_ws"],
+                    wq=config["loss_wq"],
+                    delta=config["huber_delta"],
+                )
 
-            batch_mae, batch_rmse, batch_max_abs = evaluate_tensor_metrics(output, batch.energy)
+                batch_mae, batch_rmse, batch_max_abs = evaluate_masked_tensor_metrics(
+                    output, batch.energy, batch.energy_mask
+                )
             valid_loss_sum += l.item()
             valid_mae_sum += batch_mae
             valid_rmse_sum += batch_rmse
@@ -1091,3 +1313,69 @@ print(f"Training finished. Best valid_loss = {best_valid_loss:.6e}")
 print(f"Best checkpoint: {BEST_MODEL_PATH}")
 print(f"Last checkpoint: {LAST_MODEL_PATH}")
 print(f"Training log CSV: {LOG_CSV_PATH}")
+
+# Final test evaluation using best checkpoint and JSON export
+if os.path.exists(BEST_MODEL_PATH):
+    best_ckpt = torch.load(BEST_MODEL_PATH, map_location=device)
+    net.load_state_dict(best_ckpt["model_state_dict"])
+    net.eval()
+
+    test_loss_sum = 0.0
+    test_mae_sum = 0.0
+    test_rmse_sum = 0.0
+    test_max_abs_sum = 0.0
+    test_records = []
+    test_record_idx = 0
+
+    with torch.no_grad():
+        for batch in test_dataloader:
+            batch = batch.to(device)
+            with autocast():
+                output = net(batch)
+                l = weighted_masked_huber_loss(
+                    output,
+                    batch.energy,
+                    batch.energy_mask,
+                    ws=config["loss_ws"],
+                    wq=config["loss_wq"],
+                    delta=config["huber_delta"],
+                )
+
+            batch_mae, batch_rmse, batch_max_abs = evaluate_masked_tensor_metrics(
+                output, batch.energy, batch.energy_mask
+            )
+            test_loss_sum += l.item()
+            test_mae_sum += batch_mae
+            test_rmse_sum += batch_rmse
+            test_max_abs_sum += batch_max_abs
+
+            output_cpu = output.detach().cpu()
+            target_cpu = batch.energy.detach().cpu()
+            mask_cpu = batch.energy_mask.detach().cpu()
+            for i in range(output_cpu.shape[0]):
+                test_records.append(
+                    {
+                        "test_order_index": test_record_idx,
+                        "target_tensor": target_cpu[i].tolist(),
+                        "pred_tensor": output_cpu[i].tolist(),
+                        "mask_tensor": mask_cpu[i].tolist(),
+                    }
+                )
+                test_record_idx += 1
+
+    test_loss = test_loss_sum / max(len(test_dataloader), 1)
+    test_mae = test_mae_sum / max(len(test_dataloader), 1)
+    test_rmse = test_rmse_sum / max(len(test_dataloader), 1)
+    test_max_abs = test_max_abs_sum / max(len(test_dataloader), 1)
+
+    test_json_path = os.path.join(SAVE_DIR, "test_predictions_best.json")
+    with open(test_json_path, "w", encoding="utf-8") as f:
+        json.dump(test_records, f, ensure_ascii=False)
+
+    print(
+        f"[Test @ Best] "
+        f"loss={test_loss:.6e} | mae={test_mae:.6e} | rmse={test_rmse:.6e} | max_abs={test_max_abs:.6e}"
+    )
+    print(f"Test predictions JSON: {test_json_path}")
+else:
+    print(f"Best checkpoint not found at {BEST_MODEL_PATH}, skip final test evaluation.")
